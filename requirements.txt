@@ -1,0 +1,9 @@
+torch
+numpy
+PyYAML
+pandas
+matplotlib
+pytest
+scikit-learn
+h5py
+webdataset

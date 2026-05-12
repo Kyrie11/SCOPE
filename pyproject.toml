@@ -1,0 +1,10 @@
+[project]
+name = "scope-research"
+version = "0.1.0"
+description = "SCOPE: Surface-Constrained Operator Planning research implementation"
+requires-python = ">=3.10"
+dependencies = ["torch", "numpy", "PyYAML", "pandas", "matplotlib", "pytest"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

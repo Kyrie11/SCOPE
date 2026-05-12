@@ -1,0 +1,3 @@
+training: {batch_size: 32, lr: 0.0002, weight_decay: 0.01, epochs: 50, grad_clip_norm: 5.0, num_workers: 8, mixed_precision: true, eval_every_epochs: 1, save_best_metric: val_query_outcome_nll}
+loss_weights: {w_obs: 1.0, w_sim_outcome: 1.0, w_sim_pressure: 1.0, w_sim_traj: 1.0, w_sim_safety: 1.0, w_fd: 0.5, w_query: 0.5, w_inv: 0.2, w_boundary: 0.2, w_cal: 0.0}
+support_query: {support_sizes: [0,1,2,4,8], query_min_size: 1, num_splits_per_group: 2}
