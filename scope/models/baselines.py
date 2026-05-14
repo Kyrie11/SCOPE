@@ -1,25 +1,73 @@
-from typing import Any, Dict
+"""Internal baselines and ablation model adapters."""
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import torch
 from torch import nn
-from scope.models.scope_surface import SCOPEResponseSurface
 
-class EgoCondResponse(SCOPEResponseSurface):
-    def forward(self,batch,support_mode='scene_only'):
-        return super().forward(batch,'scene_only')
-class EgoCondTraj(EgoCondResponse): pass
-class SharedCtxSlots(EgoCondResponse): pass
-class SCOPE_NoSupport(SCOPEResponseSurface):
-    def forward(self,batch,support_mode='scene_only'): return super().forward(batch,'scene_only')
-class SCOPE_NoBoundary(SCOPEResponseSurface): pass
-class SCOPE_NoFD(SCOPEResponseSurface): pass
-class SCOPE_Full(SCOPEResponseSurface): pass
-class PhysicalProbe(nn.Module):
-    def __init__(self, config=None): super().__init__(); self.config=config or {}
-    def forward(self,batch,support_mode='scene_only'):
-        import torch
-        B,K=batch['ego_candidates'].shape[:2]; M=5; dev=batch['ego_candidates'].device
-        return {'outcome_logits':torch.zeros(B,K,M,device=dev),'outcome_prob':torch.ones(B,K,M,device=dev)/M,'pressure_exceedance_logits':torch.zeros(B,K,3,device=dev),'pressure_exceedance_prob':torch.zeros(B,K,3,device=dev),'pressure_mean':torch.zeros(B,K,device=dev),'traj_params':{},'traj_samples':batch['ego_candidates'][:,:,None],'collision_prob':torch.zeros(B,K,device=dev),'near_collision_prob':torch.zeros(B,K,device=dev),'hard_brake_prob':torch.zeros(B,K,device=dev),'high_pressure_prob':torch.zeros(B,K,device=dev),'forced_dependence_prob':torch.zeros(B,K,device=dev),'collision_risk_by_outcome':torch.zeros(B,K,M,device=dev),'operator_slots':torch.zeros(B,1,1,device=dev),'operator_attention':torch.zeros(B,K,1,device=dev),'query_embeddings':torch.zeros(B,K,1,device=dev),'response_embeddings':torch.zeros(B,K,1,device=dev),'surface_sensitivity':torch.zeros(B,K,device=dev),'uncertainty':torch.zeros(B,K,device=dev)}
+from scope.models.heads import ResponseHeads
+from scope.models.scene_encoder import MLP, SceneEncoder
 
-def build_model(config: Dict[str,Any]):
-    name=config.get('model_name','scope_full')
-    cls={'ego_cond_traj':EgoCondTraj,'ego_cond_response':EgoCondResponse,'shared_ctx_slots':SharedCtxSlots,'scope_no_support':SCOPE_NoSupport,'scope_no_boundary':SCOPE_NoBoundary,'scope_no_fd':SCOPE_NoFD,'scope_full':SCOPE_Full,'physical_probe':PhysicalProbe}.get(name, SCOPE_Full)
-    return cls(config)
+
+class EgoCondTraj(nn.Module):
+    """Candidate-wise trajectory and unconditional risk predictor without branch/burden/operator."""
+
+    def __init__(self, hidden_dim: int = 256, future_steps: int = 80, modes: int = 6):
+        super().__init__()
+        self.scene = SceneEncoder(hidden_dim=hidden_dim)
+        self.u = MLP(8 + 7, hidden_dim, hidden_dim, 3, 0.1)
+        self.traj = MLP(hidden_dim, hidden_dim, modes * future_steps * 5, 2, 0.1)
+        self.risk = MLP(hidden_dim, hidden_dim, 4, 2, 0.1)
+        self.modes = modes
+        self.future_steps = future_steps
+
+    def forward(self, batch):
+        ctx = self.scene(batch).mean(dim=1).unsqueeze(1)
+        x = torch.cat([batch["query_ctrl"], batch["query_anchors"]], dim=-1)
+        h = self.u(x) + ctx
+        b, q, _ = h.shape
+        return {"trajectory_loc": self.traj(h).reshape(b, q, self.modes, self.future_steps, 5), "safety_logits": self.risk(h)}
+
+
+class EgoCondResponse(nn.Module):
+    """Candidate-wise branch/burden/traj/safety predictor with no shared same-root operator."""
+
+    def __init__(self, hidden_dim: int = 256, future_steps: int = 80, modes: int = 6):
+        super().__init__()
+        self.scene = SceneEncoder(hidden_dim=hidden_dim)
+        self.u = MLP(8 + 7, hidden_dim, hidden_dim, 3, 0.1)
+        self.heads = ResponseHeads(hidden_dim, 5, modes, future_steps, 5, 0.1)
+
+    def forward(self, batch):
+        ctx = self.scene(batch).mean(dim=1).unsqueeze(1)
+        x = torch.cat([batch["query_ctrl"], batch["query_anchors"]], dim=-1)
+        return self.heads(self.u(x) + ctx)
+
+
+@dataclass
+class AblationSwitches:
+    use_support_query: bool = True
+    use_scene_only_loss: bool = True
+    use_support_adapted_loss: bool = True
+    use_distillation: bool = True
+    use_manifold_loss: bool = True
+    use_forced_dependence: bool = True
+    use_boundary_constraint: bool = True
+    risk_pressure_penalty_only: bool = False
+
+
+def switches_from_config(cfg: dict) -> AblationSwitches:
+    model = cfg.get("model", {})
+    planning = cfg.get("planning", {})
+    baseline = cfg.get("baseline", {})
+    return AblationSwitches(
+        use_support_query=model.get("use_support_query", True),
+        use_scene_only_loss=model.get("use_scene_only_loss", True),
+        use_support_adapted_loss=model.get("use_support_adapted_loss", True),
+        use_distillation=model.get("use_distillation", True),
+        use_manifold_loss=model.get("use_manifold_loss", True),
+        use_forced_dependence=planning.get("use_forced_dependence", True),
+        use_boundary_constraint=planning.get("use_boundary_constraint", True),
+        risk_pressure_penalty_only=baseline.get("risk_pressure_penalty_only", False),
+    )

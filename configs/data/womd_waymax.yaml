@@ -1,7 +1,50 @@
-seed: 42
-horizon: {history_seconds: 1.0, future_seconds: 8.0, dt: 0.1, history_steps: 10, future_steps: 80}
-data: {max_relevant_agents: 8, candidates_per_scene: 32, min_valid_history_steps: 10, min_valid_future_steps: 60, max_map_polylines: 256, max_polyline_points: 20, shard_size: 512}
-mining: {max_distance_m: 80.0, conflict_distance_m: 15.0, arrival_time_window_s: 3.0, max_roots_per_scenario: 4}
-candidate: {max_speed_mps: 35.0, max_accel_mps2: 4.0, min_accel_mps2: -6.0, max_jerk_mps3: 8.0, max_yaw_rate_radps: 0.8, delay_values_s: [0.5, 1.0], advance_values_s: [0.5], speed_scale_values: [0.8, 0.9, 1.1], neighbor_max_edit_distance: 1, neighbor_distance_m: 8.0}
-waymax: {sim_agent_policy: waymax_reactive, rollout_steps: 80, tracking_error_threshold_m: 1.0, tracking_yaw_error_threshold_rad: 0.3, reactive_replay_divergence_min_m: 0.2}
-labels: {hard_brake_threshold_mps2: 3.5, extreme_brake_threshold_mps2: 5.0, mild_brake_threshold_mps2: 1.5, ttc_late_threshold_s: 1.5, near_collision_ttc_s: 1.0, near_collision_distance_m: 2.0, delay_threshold_s: 1.0, priority_threshold: 0.5, post_encroachment_gap_threshold_m: 3.0, high_pressure_threshold: 2, pressure_same_delta: 0, pressure_boundary_delta: 1, noncede_risk_threshold: 0.5}
+seed: 13
+output:
+  dataset_dir: outputs/datasets/scope_womd_waymax
+data:
+  split: train
+  source: womd
+  womd_version: "1.1.0"
+  data_path: null
+  max_num_objects: 128
+  history_horizon_s: 2.0
+  future_horizon_s: 8.0
+  dt: 0.1
+  include_sdc_paths: true
+  allow_synthetic: false
+  synthetic_count: 8
+  relevant_agents: 12
+  neighbor_count: 8
+  agent_types: [vehicle]
+candidates:
+  candidate_count: 32
+  timing_shifts_s: [-1.0, -0.5, 0.0, 0.5, 1.0, 1.5]
+  speed_multipliers: [0.75, 0.9, 1.0, 1.1]
+  lateral_durations_s: [2.0, 3.0, 4.0, 5.0]
+  lateral_midpoint_shifts_s: [-0.5, 0.0, 0.5]
+  planner_proposals: 8
+  max_repair_candidates: 8
+rollout:
+  backend: waymax
+  fallback_to_reactive: true
+  policy_family_id: idm_default
+  multi_policy: false
+  policy_family:
+    neutral_idm:
+      desired_time_headway: 1.5
+      min_gap: 2.0
+      max_accel: 2.0
+      comfortable_decel: 2.0
+      yield_bias: 0.0
+    conservative_idm:
+      desired_time_headway: 2.0
+      min_gap: 4.0
+      max_accel: 1.5
+      comfortable_decel: 1.5
+      yield_bias: 0.6
+    assertive_idm:
+      desired_time_headway: 1.0
+      min_gap: 1.0
+      max_accel: 2.5
+      comfortable_decel: 3.0
+      yield_bias: -0.5

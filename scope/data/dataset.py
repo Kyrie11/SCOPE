@@ -1,48 +1,139 @@
+"""PyTorch dataloader preserving same-root group structure."""
+from __future__ import annotations
+
+import glob
 from pathlib import Path
-from typing import Any, Dict, List, Optional
-import random, torch
+from typing import Any
+
+import numpy as np
+import torch
 from torch.utils.data import Dataset
-from scope.utils.io import list_shards, load_torch_shard, save_torch_shard
-from scope.data.schema import SameRootGroup, CandidateItem, SCHEMA_VERSION
-from scope.data.labels import estimate_nonceding_risk, derive_boundary_pairs
 
-class SCOPEDataset(Dataset):
-    def __init__(self, root: str, mode: str='train_surface', max_groups: Optional[int]=None):
-        self.root=Path(root); self.mode=mode; self.groups=[]
-        for p in list_shards(root):
-            payload=load_torch_shard(p); self.groups.extend(payload.get('groups', []))
-            if max_groups and len(self.groups)>=max_groups: break
-        if max_groups: self.groups=self.groups[:max_groups]
-    def __len__(self): return len(self.groups)
-    def __getitem__(self, idx):
-        g=self.groups[idx]
-        if g.support_query_splits:
-            g.metadata=dict(g.metadata); g.metadata['_active_split']=random.choice(g.support_query_splits)
-        return g
+from scope.data.labels import compute_physical_anchors
+from scope.data.scene_schema import BRANCH_TO_INDEX, SAFETY_EVENTS, SameRootGroup, read_groups_jsonl
 
-def build_support_query_splits(candidates: List[CandidateItem], seed:int=0):
-    valid=[c.candidate_id for c in candidates if c.masks.outcome or c.masks.trajectory]
-    logged=[c.candidate_id for c in candidates if c.candidate_type=='logged']
-    rng=random.Random(seed); splits=[]
-    splits.append({'support_ids':[], 'query_ids':valid[:]})
-    if logged: splits.append({'support_ids':logged[:1], 'query_ids':[i for i in valid if i not in logged[:1]]})
-    for _ in range(2):
-        ids=valid[:]; rng.shuffle(ids); cut=max(0,min(len(ids)-1, len(ids)//3)); splits.append({'support_ids':ids[:cut], 'query_ids':ids[cut:]})
-    return splits
 
-def make_group(parsed, root, agent_id, candidates, config, simulator_policy):
-    H=config.get('horizon',{}).get('history_steps',10); T=config.get('horizon',{}).get('future_steps',80); r=root['root_time_index']; ego=root['ego_id']
-    hist=torch.as_tensor(parsed['tracks'][:, r-H+1:r+1], dtype=torch.float32).permute(1,0,2)
-    hv=torch.as_tensor(parsed['track_valid'][:, r-H+1:r+1], dtype=torch.bool).permute(1,0)
-    fut=torch.as_tensor(parsed['tracks'][:, r+1:r+1+T], dtype=torch.float32).permute(1,0,2)
-    fv=torch.as_tensor(parsed['track_valid'][:, r+1:r+1+T], dtype=torch.bool).permute(1,0)
-    g=SameRootGroup(SCHEMA_VERSION, parsed['scenario_id'], int(r), int(ego), int(agent_id), root.get('interaction_tags_by_agent',{}).get(str(agent_id), root.get('interaction_tags_by_agent',{}).get(agent_id, [])), simulator_policy, hist, hv, fut, fv, torch.as_tensor(parsed['map_polylines'], dtype=torch.float32), torch.as_tensor(parsed['map_valid'], dtype=torch.bool), None if parsed.get('traffic_lights') is None else torch.as_tensor(parsed['traffic_lights']), None if parsed.get('route') is None else torch.as_tensor(parsed['route'], dtype=torch.float32), candidates, None, {'source':'build_intervention_groups'})
-    for c in g.candidates:
-        risk=estimate_nonceding_risk(g,c.candidate_id,agent_id,config)
-        if risk is not None and c.labels.high_pressure_ceding is not None:
-            c.labels.forced_dependence=bool(c.labels.high_pressure_ceding and risk>=config.get('labels',{}).get('noncede_risk_threshold',.5) and not (c.labels.collision or c.labels.near_collision))
-            c.masks.forced_dependence=True
-    boundary=derive_boundary_pairs(g.candidates, config)
-    for c in g.candidates: c.labels.boundary_pairs=boundary; c.masks.boundary=bool(boundary)
-    g.support_query_splits=build_support_query_splits(g.candidates, seed=int(r)+int(agent_id))
-    return g
+class SameRootDataset(Dataset):
+    def __init__(self, dataset_dir: str | Path, split: str = "train", max_groups: int | None = None):
+        paths = sorted(glob.glob(str(Path(dataset_dir) / f"{split}_groups.jsonl*")))
+        if not paths:
+            raise FileNotFoundError(f"No {split}_groups.jsonl* files under {dataset_dir}")
+        groups: list[SameRootGroup] = []
+        for path in paths:
+            groups.extend(read_groups_jsonl(path))
+        self.groups = groups[:max_groups] if max_groups else groups
+
+    def __len__(self) -> int:
+        return len(self.groups)
+
+    def __getitem__(self, idx: int) -> SameRootGroup:
+        return self.groups[idx]
+
+
+def group_to_training_examples(group: SameRootGroup) -> dict[str, Any]:
+    scene = group.root_scene
+    examples = []
+    for cand in group.candidate_set:
+        for agent_idx in scene.relevant_agent_indices:
+            for policy_id in {k[1] for k in group.rollout_matrix.keys()}:
+                key = (cand.candidate_id, agent_idx, policy_id)
+                label = group.labels.get(key)
+                mask = group.masks.get(key)
+                if label is None or mask is None or not mask.valid_rollout:
+                    continue
+                anchors = compute_physical_anchors(scene, cand, agent_idx, label.agent_future).vector()
+                ctrl = control_vector(cand.control_edits)
+                safety = np.array([float(label.safety[e]) for e in SAFETY_EVENTS], dtype=np.float32)
+                examples.append({
+                    "candidate_id": cand.candidate_id,
+                    "agent_index": agent_idx,
+                    "policy_id": policy_id,
+                    "ctrl": ctrl,
+                    "anchors": anchors,
+                    "ego_future": cand.future_states[:, :7].astype(np.float32),
+                    "agent_future": label.agent_future[:, :7].astype(np.float32),
+                    "branch": label.branch,
+                    "burden": label.burden,
+                    "safety": safety,
+                    "neighbor_ids": [e.target for e in group.neighbor_edges if e.source == cand.candidate_id] + [e.source for e in group.neighbor_edges if e.target == cand.candidate_id],
+                })
+    return {"group": group, "examples": examples}
+
+
+def control_vector(edits: dict[str, Any]) -> np.ndarray:
+    gap = edits.get("target_gap_id")
+    gap_code = {None: 0.0, "current": 0.0, "earlier": -1.0, "later": 1.0}.get(gap, 0.0)
+    return np.array([
+        float(edits.get("delta_t", 0.0)),
+        float(edits.get("speed_multiplier", 1.0)),
+        gap_code,
+        0.0 if edits.get("target_lane_id") is None else float(hash(edits.get("target_lane_id")) % 997) / 997.0,
+        float(edits.get("longitudinal_buffer_m", 0.0)),
+        float(edits.get("time_headway_s", 1.5)),
+        float(edits.get("lane_entry_duration_s", 3.0)),
+        float(edits.get("lateral_midpoint_shift_s", 0.0)),
+    ], dtype=np.float32)
+
+
+def collate_same_root_groups(groups: list[SameRootGroup]) -> dict[str, Any]:
+    converted = [group_to_training_examples(g) for g in groups]
+    batch_examples = [ex for item in converted for ex in item["examples"]]
+    if not batch_examples:
+        raise ValueError("Batch contains no valid examples")
+    max_q = max(len(item["examples"]) for item in converted)
+    b = len(converted)
+    t = batch_examples[0]["ego_future"].shape[0]
+    ctrl = np.zeros((b, max_q, 8), dtype=np.float32)
+    anchors = np.zeros((b, max_q, 7), dtype=np.float32)
+    ego_future = np.zeros((b, max_q, t, 7), dtype=np.float32)
+    branch = np.zeros((b, max_q), dtype=np.int64)
+    burden = np.zeros((b, max_q), dtype=np.int64)
+    safety = np.zeros((b, max_q, len(SAFETY_EVENTS)), dtype=np.float32)
+    traj = np.zeros((b, max_q, t, 7), dtype=np.float32)
+    mask = np.zeros((b, max_q), dtype=np.float32)
+    scene_features = np.zeros((b, 16), dtype=np.float32)
+    for bi, item in enumerate(converted):
+        g = item["group"]
+        scene_features[bi] = scene_summary_features(g)
+        for qi, ex in enumerate(item["examples"]):
+            ctrl[bi, qi] = ex["ctrl"]
+            anchors[bi, qi] = ex["anchors"]
+            ego_future[bi, qi] = ex["ego_future"]
+            branch[bi, qi] = ex["branch"]
+            burden[bi, qi] = ex["burden"]
+            safety[bi, qi] = ex["safety"]
+            traj[bi, qi] = ex["agent_future"]
+            mask[bi, qi] = 1.0
+    return {
+        "groups": groups,
+        "scene_features": torch.from_numpy(scene_features),
+        "query_ctrl": torch.from_numpy(ctrl),
+        "query_anchors": torch.from_numpy(anchors),
+        "query_future_tokens": torch.from_numpy(ego_future),
+        "branch": torch.from_numpy(branch),
+        "burden": torch.from_numpy(burden),
+        "safety": torch.from_numpy(safety),
+        "trajectory": torch.from_numpy(traj),
+        "mask": torch.from_numpy(mask),
+    }
+
+
+def scene_summary_features(group: SameRootGroup) -> np.ndarray:
+    scene = group.root_scene
+    ego = scene.root_state(scene.ego_track_index)
+    rel_states = [scene.root_state(i) for i in scene.relevant_agent_indices]
+    feats = np.zeros(16, dtype=np.float32)
+    feats[0:4] = [ego[3], ego[4], ego[5], ego[6]]
+    if rel_states:
+        rel = np.stack([s[:2] - ego[:2] for s in rel_states])
+        dist = np.linalg.norm(rel, axis=-1)
+        feats[4:8] = [float(np.min(dist)), float(np.mean(dist)), float(len(rel_states)), float(len(group.candidate_set))]
+    feats[8] = float("dense_gap" in scene.scenario_tags)
+    feats[9] = float("conflict_zone_overlap" in scene.scenario_tags)
+    feats[10] = float("close_following" in scene.scenario_tags)
+    feats[11] = scene.history_horizon_s
+    feats[12] = scene.future_horizon_s
+    feats[13] = scene.dt
+    feats[14] = len(scene.map_features.features)
+    feats[15] = len(group.neighbor_edges)
+    return feats
