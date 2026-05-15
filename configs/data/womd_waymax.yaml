@@ -1,6 +1,6 @@
 seed: 13
 output:
-  dataset_dir: /data0/senzeyu2/dataset/WOMD/SCOPE
+  dataset_dir: /home/senzeyu2/code/SCOPE/dataset
 data:
   split: train
   source: womd
