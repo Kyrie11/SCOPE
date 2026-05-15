@@ -31,13 +31,16 @@ from scope.geometry.map_utils import infer_route_from_logged_future
 @dataclass
 class LoaderConfig:
     split: str = "train"
-    womd_version: str = "1.1.0"
+    womd_version: str = "1.3.1"
     data_path: str | None = None
     max_num_objects: int = 128
+    max_num_rg_points: int = 30000
     history_horizon_s: float = 2.0
     future_horizon_s: float = 8.0
     dt: float = 0.1
     include_sdc_paths: bool = True
+    num_paths: int | None = 45
+    num_points_per_path: int | None = 800
     allow_synthetic: bool = False
     synthetic_count: int = 4
 
@@ -97,22 +100,56 @@ class WOMDWaymaxLoader:
     def _iter_waymax(self) -> Iterator[RootScene]:
         waymax_config = importlib.import_module("waymax.config")
         dataloader = importlib.import_module("waymax.dataloader")
-        cfg_name = {
-            "train": "WOD_1_1_0_TRAINING",
-            "training": "WOD_1_1_0_TRAINING",
-            "val": "WOD_1_1_0_VALIDATION",
-            "validation": "WOD_1_1_0_VALIDATION",
-            "test": "WOD_1_1_0_TEST",
-        }.get(self.cfg.split, "WOD_1_1_0_TRAINING")
-        dataset_cfg = getattr(waymax_config, cfg_name)
         import dataclasses
 
-        kwargs = {"max_num_objects": self.cfg.max_num_objects}
+        split_key = {
+            "train": "TRAINING",
+            "training": "TRAINING",
+            "val": "VALIDATION",
+            "validation": "VALIDATION",
+            "test": "TESTING",
+            "testing": "TESTING",
+        }.get(self.cfg.split, "TRAINING")
+
+        version_key = self.cfg.womd_version.replace(".", "_")
+        cfg_name = f"WOD_{version_key}_{split_key}"
+
+        if hasattr(waymax_config, cfg_name):
+            dataset_cfg = getattr(waymax_config, cfg_name)
+        else:
+            # 兼容旧 Waymax：没有 WOD_1_3_1_* 时手动构造 DatasetConfig
+            dataset_cfg = waymax_config.DatasetConfig(
+                path=self.cfg.data_path,
+                max_num_objects=self.cfg.max_num_objects,
+                max_num_rg_points=self.cfg.max_num_rg_points,
+                include_sdc_paths=self.cfg.include_sdc_paths,
+                num_paths=self.cfg.num_paths,
+                num_points_per_path=self.cfg.num_points_per_path,
+            )
+
+        kwargs = {
+            "max_num_objects": self.cfg.max_num_objects,
+            "max_num_rg_points": self.cfg.max_num_rg_points,
+            "include_sdc_paths": self.cfg.include_sdc_paths,
+        }
+
         if self.cfg.data_path:
             kwargs["path"] = self.cfg.data_path
-        if hasattr(dataset_cfg, "include_sdc_paths"):
-            kwargs["include_sdc_paths"] = self.cfg.include_sdc_paths
-        dataset_cfg = dataclasses.replace(dataset_cfg, **{k: v for k, v in kwargs.items() if hasattr(dataset_cfg, k)})
+
+        if self.cfg.include_sdc_paths:
+            if self.cfg.num_paths is None or self.cfg.num_points_per_path is None:
+                raise ValueError(
+                    "include_sdc_paths=true requires num_paths and num_points_per_path. "
+                    "For WOMD v1.3.1 use num_paths=45 and num_points_per_path=800."
+                )
+            kwargs["num_paths"] = self.cfg.num_paths
+            kwargs["num_points_per_path"] = self.cfg.num_points_per_path
+
+        dataset_cfg = dataclasses.replace(
+            dataset_cfg,
+            **{k: v for k, v in kwargs.items() if hasattr(dataset_cfg, k)}
+        )
+
         gen = dataloader.simulator_state_generator(config=dataset_cfg)
         for state in gen:
             yield self.simulator_state_to_root_scene(state)
@@ -158,7 +195,11 @@ class WOMDWaymaxLoader:
             route_context=route_context,
             scenario_tags=[],
             relevant_agent_indices=[],
-            metadata={"loader": "waymax", "history_fallback_applied": hist < self.cfg.history_horizon_s},
+            metadata={
+                "loader": "waymax",
+                "history_fallback_applied": hist < self.cfg.history_horizon_s,
+                "waymax_state": state,
+            },
         )
 
 

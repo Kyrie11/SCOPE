@@ -1212,6 +1212,13 @@ python -m scope.experiments.run_false_safe_offline \
 # 8. 实验 4
 python -m scope.experiments.run_closed_loop \
   --config configs/experiment/closed_loop.yaml
+
+# 9.可视化
+python -m scope.data.visualize_dataset_samples \
+  --dataset_dir outputs/datasets/scope_womd_waymax \
+  --split train \
+  --num_samples 8 \
+  --output_dir outputs/datasets/scope_womd_waymax/viz
 ```
 
 ---

@@ -26,43 +26,53 @@ def summarize_dataset(dataset_dir: str | Path) -> dict:
     boundary_valid = 0
     duplicate = 0
     candidates = 0
+    route_inferred = 0
+    route_total = 0
+    sdc_paths_count = []
+    empty_relevant = 0
+    empty_neighbor_edges = 0
+    empty_labels = 0
+    candidate_shape_bad = 0
+    agent_future_shape_bad = 0
+    groups_with_fd_valid = 0
+    groups_with_boundary_valid = 0
     for path in paths:
         groups = read_groups_jsonl(path)
         split = Path(path).name.split("_")[0]
         for g in groups:
-            candidates += len(g.candidate_set)
-            duplicate += sum(1 for c in g.candidate_set if c.feasibility.get("duplicate_of") is not None)
-            tags.update(g.root_scene.scenario_tags)
-            total_rollouts += len(g.masks)
-            for mask in g.masks.values():
-                valid_rollouts += int(mask.valid_rollout)
-                fd_valid += int(mask.fd_diag_valid)
-                boundary_valid += int(mask.boundary_valid)
+            route_total += 1
+            route_inferred += int(g.root_scene.route_context.inferred)
+            sdc_paths_count.append(len(g.root_scene.route_context.sdc_paths))
+
+            empty_relevant += int(len(g.root_scene.relevant_agent_indices) == 0)
+            empty_neighbor_edges += int(len(g.neighbor_edges) == 0)
+            empty_labels += int(len(g.labels) == 0)
+
+            expected_steps = int(round(g.root_scene.future_horizon_s / g.root_scene.dt))
+
+            for c in g.candidate_set:
+                if c.future_states.shape[0] != expected_steps:
+                    candidate_shape_bad += 1
+
             for label in g.labels.values():
-                branch[BRANCHES[label.branch]] += 1
-                burden[label.burden] += 1
-                fd = label.diagnostics.get("fd_diagnostic")
-                if fd is True:
-                    fd_pos += 1
-                for item in label.diagnostics.get("boundary_positive_edges", []):
-                    boundary_pos += int(bool(item))
+                if label.agent_future.shape[0] != expected_steps:
+                    agent_future_shape_bad += 1
+
+            groups_with_fd_valid += int(any(m.fd_diag_valid for m in g.masks.values()))
+            groups_with_boundary_valid += int(any(m.boundary_valid for m in g.masks.values()))
             rows.append({"split": split, "scene_id": g.scene_id, "candidates": len(g.candidate_set), "valid_rollouts": valid_rollouts, "labels": len(g.labels)})
-    scenes = len({r["scene_id"] for r in rows})
     groups_n = len(rows)
-    summary = {
-        "scenes": scenes,
-        "root_groups": groups_n,
-        "candidates_per_group": candidates / max(groups_n, 1),
-        "valid_rollouts": valid_rollouts,
-        "simulator_failure_rate": 1.0 - valid_rollouts / max(total_rollouts, 1),
-        "branch_distribution": dict(branch),
-        "burden_distribution": {str(k): v for k, v in burden.items()},
-        "scenario_type_counts": dict(tags),
-        "fd_positive_rate": fd_pos / max(fd_valid, 1),
-        "boundary_pair_positive_rate": boundary_pos / max(boundary_valid, 1),
-        "duplicate_candidate_rate": duplicate / max(candidates, 1),
-        "calibration_set_coverage": sum(1 for r in rows if r["split"] in {"val", "validation"}) / max(groups_n, 1),
-    }
+    summary.update({
+        "route_inferred_rate": route_inferred / max(route_total, 1),
+        "sdc_paths_per_group_mean": float(np.mean(sdc_paths_count)) if sdc_paths_count else 0.0,
+        "empty_relevant_agent_rate": empty_relevant / max(groups_n, 1),
+        "empty_neighbor_edge_rate": empty_neighbor_edges / max(groups_n, 1),
+        "empty_label_group_rate": empty_labels / max(groups_n, 1),
+        "candidate_shape_bad": candidate_shape_bad,
+        "agent_future_shape_bad": agent_future_shape_bad,
+        "groups_with_fd_valid_rate": groups_with_fd_valid / max(groups_n, 1),
+        "groups_with_boundary_valid_rate": groups_with_boundary_valid / max(groups_n, 1),
+    })
     return summary
 
 
